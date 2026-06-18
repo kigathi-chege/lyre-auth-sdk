@@ -1,0 +1,87 @@
+name: Publish @~lyre/auth
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/publish.yml'
+      - 'dist/**'
+      - 'src/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'tsconfig.json'
+      - 'README.md'
+      - 'LICENSE'
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  publish:
+    name: Publish
+    runs-on: ubuntu-latest
+    environment: Home
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Update npm
+        run: npm install -g npm@latest
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Check local vs published version
+        id: version_check
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PACKAGE_NAME="$(node -p "require('./package.json').name")"
+          LOCAL_VERSION="$(node -p "require('./package.json').version")"
+          echo "Local package: $PACKAGE_NAME@$LOCAL_VERSION"
+
+          set +e
+          PUBLISHED_VERSION="$(npm view "$PACKAGE_NAME" version 2>/dev/null)"
+          set -e
+
+          if [ -z "${PUBLISHED_VERSION:-}" ]; then
+            echo "No published version found (first-time publish). Proceeding."
+            echo "should_publish=true" >> "$GITHUB_OUTPUT"
+          elif [ "$LOCAL_VERSION" = "$PUBLISHED_VERSION" ]; then
+            echo "Version unchanged ($LOCAL_VERSION). Skipping publish."
+            echo "should_publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Version changed: $PUBLISHED_VERSION → $LOCAL_VERSION. Proceeding."
+            echo "should_publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build
+        if: steps.version_check.outputs.should_publish == 'true'
+        run: npm run build --if-present
+
+      - name: Typecheck
+        if: steps.version_check.outputs.should_publish == 'true'
+        run: npm run check --if-present
+
+      - name: Publish to npm (Trusted Publishing / OIDC)
+        if: steps.version_check.outputs.should_publish == 'true'
+        run: npm publish --access public
+
+      - name: Summary
+        if: always()
+        run: |
+          if [ "${{ steps.version_check.outputs.should_publish }}" = "true" ]; then
+            echo "✅ Published a new version to npm."
+          else
+            echo "ℹ️ No version change — nothing to publish (existing version stays live)."
+          fi

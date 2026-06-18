@@ -1,0 +1,64 @@
+{
+  "name": "@~lyre/auth",
+  "version": "0.0.4",
+  "description": "Shared Axis Accounts auth SDK — framework-agnostic session/identity core (HMAC-signed cookies, accounts login/callback/logout) plus an optional turnkey SvelteKit adapter.",
+  "type": "module",
+  "sideEffects": false,
+  "license": "MIT",
+  "author": "Britam Trust Services / Lyre",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kigathi-chege/lyre-auth-sdk.git"
+  },
+  "homepage": "https://github.com/kigathi-chege/lyre-auth-sdk#readme",
+  "bugs": {
+    "url": "https://github.com/kigathi-chege/lyre-auth-sdk/issues"
+  },
+  "keywords": [
+    "auth",
+    "sso",
+    "accounts",
+    "session",
+    "sveltekit",
+    "hmac",
+    "lyre"
+  ],
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./sveltekit": {
+      "types": "./dist/sveltekit.d.ts",
+      "import": "./dist/sveltekit.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsup src/index.ts src/sveltekit.ts --format esm --dts --clean",
+    "check": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@sveltejs/kit": "^2.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@sveltejs/kit": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@sveltejs/kit": "^2.0.0",
+    "@types/node": "^22",
+    "tsup": "^8.3.5",
+    "typescript": "^6.0.2"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
