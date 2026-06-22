@@ -83,11 +83,17 @@ export type AccountsTokenResponse = {
 	expires_in: number;
 	user: {
 		id: string;
+		// Axis Accounts returns camelCase (`emailAddress`, `firstName`, …); older/other providers
+		// may use snake_case or `email`. We accept all and normalize in normalizeIdentity().
 		email?: string;
+		emailAddress?: string;
 		name?: string;
 		first_name?: string;
+		firstName?: string;
 		last_name?: string;
+		lastName?: string;
 		avatar_url?: string;
+		avatarUrl?: string;
 	};
 };
 
@@ -376,13 +382,16 @@ function parseAuthorizationState(value: string): AuthorizationState {
 }
 
 function normalizeIdentity(user: AccountsTokenResponse['user']): AccountsIdentity {
+	const firstName = user.firstName ?? user.first_name;
+	const lastName = user.lastName ?? user.last_name;
 	return {
 		id: user.id,
-		email: user.email ?? `${user.id}@accounts.local`,
-		name: user.name ?? ([user.first_name, user.last_name].filter(Boolean).join(' ') || 'Accounts User'),
-		firstName: user.first_name,
-		lastName: user.last_name,
-		avatarUrl: user.avatar_url
+		// Prefer the real address under either key; only synthesize when truly absent.
+		email: user.emailAddress ?? user.email ?? `${user.id}@accounts.local`,
+		name: user.name ?? ([firstName, lastName].filter(Boolean).join(' ') || 'Accounts User'),
+		firstName,
+		lastName,
+		avatarUrl: user.avatarUrl ?? user.avatar_url
 	};
 }
 
