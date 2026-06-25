@@ -3,6 +3,11 @@ import { createHmac, timingSafeEqual } from 'node:crypto';
 const SESSION_COOKIE_NAME = 'platform_session';
 const STATE_COOKIE_NAME = 'accounts_auth_state';
 
+function normalizeOptionalString(value: string | null | undefined): string | undefined {
+	const trimmed = value?.trim();
+	return trimmed ? trimmed : undefined;
+}
+
 export type PermissionSet = string[];
 
 export type AccountsIdentity = {
@@ -107,9 +112,9 @@ export type SyncAccountsUser = (identity: AccountsIdentity) => SyncAccountsUserR
 
 export function createAccountsClientConfig(input: Partial<AccountsClientConfig> = {}): AccountsClientConfig {
 	return {
-		baseUrl: input.baseUrl ?? process.env.ACCOUNTS_BASE_URL,
+		baseUrl: normalizeOptionalString(input.baseUrl ?? process.env.ACCOUNTS_BASE_URL),
 		clientId: input.clientId ?? process.env.ACCOUNTS_CLIENT_ID ?? 'accounts-app',
-		clientSecret: input.clientSecret ?? process.env.ACCOUNTS_CLIENT_SECRET,
+		clientSecret: normalizeOptionalString(input.clientSecret ?? process.env.ACCOUNTS_CLIENT_SECRET),
 		redirectUri:
 			input.redirectUri ?? process.env.ACCOUNTS_REDIRECT_URI ?? 'http://localhost:5173/auth/callback',
 		logoutRedirectUri:
@@ -240,18 +245,23 @@ export async function exchangeAuthorizationCode(input: {
 	}
 
 	const fetchImpl = input.fetchImpl ?? fetch;
+	const clientSecret = normalizeOptionalString(input.config.clientSecret);
+	const tokenBody: Record<string, string> = {
+		grant_type: 'authorization_code',
+		code: input.code,
+		redirect_uri: input.config.redirectUri,
+		client_id: input.config.clientId
+	};
+	if (clientSecret) {
+		tokenBody.client_secret = clientSecret;
+	}
+
 	const response = await fetchImpl(new URL('/api/auth/token', input.config.baseUrl), {
 		method: 'POST',
 		headers: {
 			'content-type': 'application/json'
 		},
-		body: JSON.stringify({
-			grant_type: 'authorization_code',
-			code: input.code,
-			redirect_uri: input.config.redirectUri,
-			client_id: input.config.clientId,
-			client_secret: input.config.clientSecret
-		})
+		body: JSON.stringify(tokenBody)
 	});
 
 	if (!response.ok) {
