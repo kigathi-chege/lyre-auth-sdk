@@ -3,7 +3,7 @@
 // `event.locals`, serves /auth/login · /auth/callback · /auth/logout inline, and (optionally)
 // gates protected paths. Importing this submodule pulls in `@sveltejs/kit`; the core
 // entry (`@~lyre/auth`) stays framework-agnostic. Added 0.0.2; non-breaking.
-import { redirect, type Handle, type RequestEvent } from '@sveltejs/kit';
+import { type Handle, type RequestEvent } from '@sveltejs/kit';
 import {
 	beginAccountsLoginRedirect,
 	clearPlatformSessionCookie,
@@ -123,7 +123,13 @@ export function createAuthHandle(opts: SvelteKitAuthOptions): Handle {
 					headers: { 'content-type': 'application/json' }
 				});
 			}
-			throw redirect(302, `${loginPath}?next=${encodeURIComponent(path + event.url.search)}`);
+			// RETURN a real 302 Response (not `throw redirect(...)`). When this package is consumed as an
+			// externalized dependency, a thrown `redirect()` is a `Redirect` from node_modules' copy of
+			// @sveltejs/kit, while the host's bundled kit does the `instanceof Redirect` check against its
+			// OWN copy — so the check fails and the redirect is coalesced into a fatal 500. Returning a
+			// Response (as the login/callback/logout branches already do) is handled verbatim by the host,
+			// so a 302 stays a 302 regardless of bundling.
+			return redirectWithCookies(`${loginPath}?next=${encodeURIComponent(path + event.url.search)}`, []);
 		}
 
 		return resolve(event);
