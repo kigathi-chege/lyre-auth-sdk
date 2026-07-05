@@ -434,3 +434,93 @@ function readCookie(cookieHeader: string | null | undefined, name: string) {
 
 	return null;
 }
+
+// ── App-scoped API keys (service keys) ───────────────────────────────────────────
+// A machine/SDK caller presents a key minted in Axis Accounts (prefix `sk_`). We introspect it
+// against Accounts (`POST /api/auth/service-keys/introspect`), which — authenticating on the
+// presented key itself — returns the scopes granted to the key and the apps it may act on. The
+// CONSUMING app owns what those scopes MEAN and enforces them per route; this SDK performs only the
+// authentication (verify the key + fetch its grant). Reusable by any app that consumes app-scoped
+// keys. Added 0.0.8; non-breaking. See createServiceKeyHandle() for the turnkey SvelteKit wiring.
+
+export type ServiceKeyApp = { id: string; slug: string; name?: string };
+
+export type ServiceKeyContext = {
+	keyId: string;
+	tenantId: string | null;
+	/** Scopes granted to this key (opaque strings owned by the consuming app). */
+	scopes: string[];
+	/** Apps this key may act on (auth resolves these from the key's app grant). */
+	accessibleApps: ServiceKeyApp[];
+	expiresAt: string | null;
+};
+
+// The raw key from a request: the dedicated `X-API-KEY` header, or `Authorization: Bearer sk_…`
+// (so a single Authorization header can carry EITHER a user session bearer or a service key — they
+// are told apart by the `sk_` prefix). Returns null when no service key is present.
+export function serviceKeyFromRequest(request: Request): string | null {
+	const explicit = request.headers.get('x-api-key');
+	if (explicit && explicit.trim()) return explicit.trim();
+	const auth = request.headers.get('authorization');
+	if (auth && auth.startsWith('Bearer ')) {
+		const token = auth.slice(7).trim();
+		if (token.startsWith('sk_')) return token;
+	}
+	return null;
+}
+
+type ServiceKeyIntrospectResponse = {
+	valid: boolean;
+	keyId?: string;
+	tenantId?: string | null;
+	scopes?: string[];
+	accessibleApps?: { id: string; slug: string; name?: string }[];
+	accessibleAppIds?: string[];
+	expiresAt?: string | null;
+};
+
+// Verify a service key against Axis Accounts and return its grant. Returns null (treat as
+// unauthenticated) for an invalid/revoked/expired key (auth replies HTTP 200 `{ valid: false }`),
+// a missing Accounts base URL, a non-200 upstream status, or a transport error.
+export async function introspectServiceKey(input: {
+	config: Pick<AccountsClientConfig, 'baseUrl'>;
+	key: string;
+	fetchImpl?: typeof fetch;
+}): Promise<ServiceKeyContext | null> {
+	const base = normalizeOptionalString(input.config.baseUrl);
+	if (!input.key || !base) return null;
+	const fetchImpl = input.fetchImpl ?? fetch;
+	try {
+		const res = await fetchImpl(new URL('/api/auth/service-keys/introspect', base), {
+			method: 'POST',
+			headers: { 'x-api-key': input.key, accept: 'application/json' }
+		});
+		if (!res.ok) return null;
+		const data = (await res.json()) as ServiceKeyIntrospectResponse;
+		if (!data.valid || !data.keyId) return null;
+		const accessibleApps = (data.accessibleApps ?? [])
+			.filter(
+				(a): a is ServiceKeyApp =>
+					Boolean(a) && typeof a.id === 'string' && typeof a.slug === 'string'
+			)
+			.map((a) => ({ id: a.id, slug: a.slug, name: a.name }));
+		return {
+			keyId: data.keyId,
+			tenantId: data.tenantId ?? null,
+			scopes: Array.isArray(data.scopes) ? data.scopes : [],
+			accessibleApps,
+			expiresAt: data.expiresAt ?? null
+		};
+	} catch {
+		return null;
+	}
+}
+
+// True if `granted` satisfies `required`. Flat EXACT-match, mirroring how Axis Accounts enforces
+// scopes on its own endpoints (`scopes.includes(required)`) and validates them at mint time (a key
+// can only hold scopes from auth-native ∪ the app registry, so there is no wildcard to honor).
+// Scope strings are opaque to this SDK — no prefix/wildcard semantics are assumed.
+export function scopeSatisfied(granted: string[] | undefined, required: string): boolean {
+	if (!granted || granted.length === 0) return false;
+	return granted.includes(required);
+}

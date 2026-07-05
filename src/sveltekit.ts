@@ -3,16 +3,20 @@
 // `event.locals`, serves /auth/login · /auth/callback · /auth/logout inline, and (optionally)
 // gates protected paths. Importing this submodule pulls in `@sveltejs/kit`; the core
 // entry (`@~lyre/auth`) stays framework-agnostic. Added 0.0.2; non-breaking.
+import { createHash } from 'node:crypto';
 import { type Handle, type RequestEvent } from '@sveltejs/kit';
 import {
 	beginAccountsLoginRedirect,
 	clearPlatformSessionCookie,
 	handleAccountsCallback,
 	identityPassthroughSync,
+	introspectServiceKey,
 	readPlatformSessionCookie,
+	serviceKeyFromRequest,
 	type AccountsClientConfig,
 	type CookieOptions,
 	type PlatformSession,
+	type ServiceKeyContext,
 	type SyncAccountsUser
 } from './index';
 
@@ -133,6 +137,65 @@ export function createAuthHandle(opts: SvelteKitAuthOptions): Handle {
 		}
 
 		return resolve(event);
+	};
+}
+
+// ── App-scoped API key handle ────────────────────────────────────────────────────
+// Turnkey adapter mirroring createAuthHandle, for the machine/SDK auth path. On a matched request
+// carrying a service key (`X-API-KEY` or `Authorization: Bearer sk_…`), it introspects the key
+// against Axis Accounts and, on success, sets `event.locals.serviceKey` and calls `onResolved` so
+// the app can map the grant onto its own locals. A key that is PRESENT but invalid/revoked/expired
+// gets a 401 JSON response (a request with no key passes through untouched, so cookie/bearer auth
+// still applies). Introspection is cached per key-hash (default 60s). Added 0.0.8; non-breaking.
+export type ServiceKeyHandleOptions = {
+	config: AccountsClientConfig;
+	fetchImpl?: typeof fetch;
+	/** Which requests to attempt key auth on. Default: paths starting with `/api`. */
+	match?: (event: RequestEvent) => boolean;
+	/** Introspection cache TTL in ms. Default 60_000; set 0 to disable caching. */
+	cacheTtlMs?: number;
+	/** Map the resolved key grant onto app locals. Called only for a valid key. */
+	onResolved?: (event: RequestEvent, ctx: ServiceKeyContext) => void;
+	/** Observe a present-but-invalid key (e.g. logging) before the 401 is returned. */
+	onInvalid?: (event: RequestEvent) => void;
+};
+
+// Apps consuming service keys should augment App.Locals with this.
+export type ServiceKeyLocals = { serviceKey?: ServiceKeyContext | null };
+
+export function createServiceKeyHandle(opts: ServiceKeyHandleOptions): Handle {
+	const match = opts.match ?? ((event: RequestEvent) => event.url.pathname.startsWith('/api'));
+	const ttl = opts.cacheTtlMs ?? 60_000;
+	const cache = new Map<string, { value: ServiceKeyContext | null; expires: number }>();
+
+	return async ({ event, resolve }) => {
+		if (!match(event)) return resolve(event);
+		const key = serviceKeyFromRequest(event.request);
+		if (!key) return resolve(event);
+
+		const hash = createHash('sha256').update(key).digest('hex');
+		const now = Date.now();
+		let ctx: ServiceKeyContext | null;
+		const cached = ttl > 0 ? cache.get(hash) : undefined;
+		if (cached && cached.expires > now) {
+			ctx = cached.value;
+		} else {
+			ctx = await introspectServiceKey({ config: opts.config, key, fetchImpl: opts.fetchImpl });
+			if (ttl > 0) cache.set(hash, { value: ctx, expires: now + ttl });
+		}
+
+		if (ctx) {
+			(event.locals as ServiceKeyLocals).serviceKey = ctx;
+			opts.onResolved?.(event, ctx);
+			return resolve(event);
+		}
+
+		// A key was presented but did not resolve — reject rather than silently fall through.
+		opts.onInvalid?.(event);
+		return new Response(JSON.stringify({ message: 'Invalid or expired API key.' }), {
+			status: 401,
+			headers: { 'content-type': 'application/json' }
+		});
 	};
 }
 
