@@ -11,9 +11,12 @@ import {
 	handleAccountsCallback,
 	identityPassthroughSync,
 	introspectServiceKey,
+	logoutFromAccounts,
 	readPlatformSessionCookie,
 	serviceKeyFromRequest,
+	verifyWebhookSignature,
 	type AccountsClientConfig,
+	type AccountsWebhookEvent,
 	type CookieOptions,
 	type PlatformSession,
 	type ServiceKeyContext,
@@ -113,6 +116,13 @@ export function createAuthHandle(opts: SvelteKitAuthOptions): Handle {
 		}
 
 		if (path === logoutPath) {
+			// Revoke the session upstream (best-effort) BEFORE clearing the local cookie, so logging out
+			// here also invalidates the Accounts session — not just this app's cookie. `?all=1` logs the
+			// user out of every device.
+			if (session.accessToken) {
+				const all = event.url.searchParams.get('all') === '1' || event.url.searchParams.get('all') === 'true';
+				await logoutFromAccounts({ config: opts.config, accessToken: session.accessToken, all });
+			}
 			return redirectWithCookies(postLogoutPath, [
 				clearPlatformSessionCookie(cookieOptions),
 				`${STATE_COOKIE}=; ${cookieOptions?.sameSite === 'none' ? 'Path=/; HttpOnly; SameSite=None; Secure' : 'Path=/; HttpOnly; SameSite=Lax'}; Max-Age=0`
@@ -196,6 +206,54 @@ export function createServiceKeyHandle(opts: ServiceKeyHandleOptions): Handle {
 			status: 401,
 			headers: { 'content-type': 'application/json' }
 		});
+	};
+}
+
+// ── Accounts webhook handle ──────────────────────────────────────────────────────
+// Turnkey adapter that LISTENS for Accounts webhooks and lets the app REACT. On a POST to `path`,
+// it verifies the HMAC-SHA256 signature against `secret`, parses the JSON body, and invokes
+// `onEvent` (the app's reaction — e.g. revoke local state on a `session.revoked` / `user.deleted`
+// event). The SDK owns verification + parsing; the app owns what each event type means. Returns 401
+// on a bad signature, 400 on unparseable JSON, 200 on success. Added 0.0.9; non-breaking.
+export type AccountsWebhookOptions = {
+	secret: string;
+	/** Route to receive webhooks on. Default '/api/auth/accounts/webhook'. */
+	path?: string;
+	/** Header carrying the signature. Default 'x-accounts-signature'. */
+	signatureHeader?: string;
+	/** React to a verified event. Throwing yields a 500 (Accounts may retry). */
+	onEvent: (event: AccountsWebhookEvent, raw: string, request: RequestEvent) => void | Promise<void>;
+};
+
+function jsonResponse(status: number, body: Record<string, unknown>): Response {
+	return new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
+}
+
+export function createAccountsWebhookHandle(opts: AccountsWebhookOptions): Handle {
+	const path = opts.path ?? '/api/auth/accounts/webhook';
+	const sigHeader = opts.signatureHeader ?? 'x-accounts-signature';
+
+	return async ({ event, resolve }) => {
+		if (event.url.pathname !== path || event.request.method !== 'POST') return resolve(event);
+
+		const raw = await event.request.text();
+		if (!verifyWebhookSignature(raw, event.request.headers.get(sigHeader), opts.secret)) {
+			return jsonResponse(401, { ok: false, error: 'Invalid webhook signature.' });
+		}
+
+		let payload: { type?: unknown };
+		try {
+			payload = JSON.parse(raw) as { type?: unknown };
+		} catch {
+			return jsonResponse(400, { ok: false, error: 'Invalid JSON body.' });
+		}
+
+		try {
+			await opts.onEvent({ ...(payload as object), type: String(payload.type ?? 'unknown') }, raw, event);
+		} catch {
+			return jsonResponse(500, { ok: false, error: 'Webhook handler failed.' });
+		}
+		return jsonResponse(200, { ok: true });
 	};
 }
 

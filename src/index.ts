@@ -516,6 +516,52 @@ export async function introspectServiceKey(input: {
 	}
 }
 
+// Revoke the user's session at Axis Accounts (server-side logout). Clearing the local session
+// cookie logs the user out of THIS app; this additionally revokes the session upstream so it can't
+// be reused. `all: true` revokes every session for the user (log out everywhere). Best-effort:
+// returns `{ success: false }` rather than throwing so a logout flow always completes locally.
+export async function logoutFromAccounts(input: {
+	config: Pick<AccountsClientConfig, 'baseUrl'>;
+	accessToken: string;
+	all?: boolean;
+	fetchImpl?: typeof fetch;
+}): Promise<{ success: boolean; revokedCount?: number }> {
+	const base = normalizeOptionalString(input.config.baseUrl);
+	if (!base || !input.accessToken) return { success: false };
+	const fetchImpl = input.fetchImpl ?? fetch;
+	try {
+		const res = await fetchImpl(new URL('/api/auth/logout', base), {
+			method: 'POST',
+			headers: {
+				'content-type': 'application/json',
+				authorization: `Bearer ${input.accessToken}`,
+				accept: 'application/json'
+			},
+			body: JSON.stringify({ all: input.all ?? false })
+		});
+		if (!res.ok) return { success: false };
+		return (await res.json()) as { success: boolean; revokedCount?: number };
+	} catch {
+		return { success: false };
+	}
+}
+
+// Verify an Accounts webhook signature: HMAC-SHA256 of the RAW request body, hex-encoded, compared
+// timing-safely. Accepts `sha256=<hex>` or a bare hex digest. Callers must verify BEFORE trusting a
+// webhook payload (an unsigned/forged webhook must be rejected).
+export function verifyWebhookSignature(rawBody: string, signature: string | null | undefined, secret: string): boolean {
+	if (!signature || !secret) return false;
+	const provided = (signature.startsWith('sha256=') ? signature.slice(7) : signature).toLowerCase();
+	if (!/^[0-9a-f]{64}$/.test(provided)) return false;
+	const expected = createHmac('sha256', secret).update(rawBody).digest('hex');
+	const a = Buffer.from(provided, 'hex');
+	const b = Buffer.from(expected, 'hex');
+	if (a.length !== b.length) return false;
+	return timingSafeEqual(a, b);
+}
+
+export type AccountsWebhookEvent = { type: string; [key: string]: unknown };
+
 // True if `granted` satisfies `required`. Flat EXACT-match, mirroring how Axis Accounts enforces
 // scopes on its own endpoints (`scopes.includes(required)`) and validates them at mint time (a key
 // can only hold scopes from auth-native ∪ the app registry, so there is no wildcard to honor).
