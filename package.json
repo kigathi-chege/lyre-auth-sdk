@@ -37,7 +37,8 @@
     "./nest": {
       "types": "./dist/nest.d.ts",
       "import": "./dist/nest.js"
-    }
+    },
+    "./package.json": "./package.json"
   },
   "files": [
     "dist",
