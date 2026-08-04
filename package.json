@@ -1,6 +1,6 @@
 {
   "name": "@~lyre/auth",
-  "version": "0.0.9",
+  "version": "0.1.1",
   "description": "Shared Axis Accounts auth SDK — framework-agnostic session/identity core (HMAC-signed cookies, accounts login/callback/logout) plus an optional turnkey SvelteKit adapter.",
   "type": "module",
   "sideEffects": false,
@@ -33,7 +33,12 @@
     "./sveltekit": {
       "types": "./dist/sveltekit.d.ts",
       "import": "./dist/sveltekit.js"
-    }
+    },
+    "./nest": {
+      "types": "./dist/nest.d.ts",
+      "import": "./dist/nest.js"
+    },
+    "./package.json": "./package.json"
   },
   "files": [
     "dist",
@@ -41,7 +46,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "tsup src/index.ts src/sveltekit.ts --format esm --dts --clean",
+    "build": "tsup src/index.ts src/sveltekit.ts src/nest.ts --format esm --dts --clean",
     "check": "tsc --noEmit"
   },
   "peerDependencies": {

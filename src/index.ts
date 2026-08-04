@@ -560,7 +560,21 @@ export function verifyWebhookSignature(rawBody: string, signature: string | null
 	return timingSafeEqual(a, b);
 }
 
-export type AccountsWebhookEvent = { type: string; [key: string]: unknown };
+export type AccountsWebhookEvent = { type: string; data?: unknown; [key: string]: unknown };
+
+/**
+ * Normalize an Accounts webhook body into a stable `AccountsWebhookEvent`.
+ *
+ * The Accounts webhook worker sends `{ event, timestamp, data }` (the event NAME under `event`,
+ * the payload under `data`). Older/other senders may put the name under `type`. This collapses both
+ * so a consumer always reads `event.type` and `event.data`, and keeps the raw fields alongside.
+ * Framework-agnostic so both the SvelteKit handle and the Nest helper share one shape.
+ */
+export function normalizeAccountsWebhook(payload: unknown): AccountsWebhookEvent {
+	const body = (payload && typeof payload === 'object' ? payload : {}) as Record<string, unknown>;
+	const type = String(body.event ?? body.type ?? 'unknown');
+	return { ...body, type, data: body.data };
+}
 
 // True if `granted` satisfies `required`. Flat EXACT-match, mirroring how Axis Accounts enforces
 // scopes on its own endpoints (`scopes.includes(required)`) and validates them at mint time (a key
