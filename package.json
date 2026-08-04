@@ -1,7 +1,7 @@
 {
   "name": "@~lyre/auth",
-  "version": "0.1.0",
-  "description": "Shared Axis Accounts auth SDK \u2014 framework-agnostic session/identity core (HMAC-signed cookies, accounts login/callback/logout) plus an optional turnkey SvelteKit adapter.",
+  "version": "0.1.1",
+  "description": "Shared Axis Accounts auth SDK — framework-agnostic session/identity core (HMAC-signed cookies, accounts login/callback/logout) plus an optional turnkey SvelteKit adapter.",
   "type": "module",
   "sideEffects": false,
   "license": "MIT",

@@ -11,9 +11,12 @@
 import { createHash } from 'node:crypto';
 import {
 	introspectServiceKey,
+	normalizeAccountsWebhook,
 	scopeSatisfied,
 	serviceKeyFromRequest,
+	verifyWebhookSignature,
 	type AccountsClientConfig,
+	type AccountsWebhookEvent,
 	type ServiceKeyContext
 } from './index.js';
 
@@ -210,4 +213,44 @@ export function canAccessApp(ctx: ServiceKeyContext, appIdOrSlug: string): boole
 	return ctx.accessibleApps.some((a) => a.id === appIdOrSlug || a.slug === appIdOrSlug);
 }
 
-export type { ServiceKeyContext, AccountsClientConfig };
+// ── Accounts webhook receipt (Nest/Fastify) ───────────────────────────────────────
+// The SDK owns the security-sensitive parts (signature verification + parsing); the consuming
+// service supplies the controller and decides what each event MEANS. Mirrors the SvelteKit
+// `createAccountsWebhookHandle` but framework-light: pass the raw body + the signature header value.
+
+export type AccountsWebhookResult =
+	| { ok: true; event: AccountsWebhookEvent }
+	| { ok: false; reason: 'bad_signature' | 'bad_json' };
+
+/** Header the Accounts webhook worker sends (HMAC-SHA256 hex of the raw body). */
+export const ACCOUNTS_WEBHOOK_SIGNATURE_HEADER = 'x-webhook-signature';
+
+/**
+ * Verify an Accounts webhook and parse it into a normalized `{ type, data, ... }` event.
+ *
+ * Pass the RAW request body (a Nest/Fastify controller must read the raw body, not a re-serialized
+ * object — the signature is over the exact bytes), the signature header value
+ * (`request.headers['x-webhook-signature']`), and the shared secret. Returns `{ok:false}` on a bad
+ * signature or unparseable JSON so the controller can 401/400; `{ok:true, event}` otherwise. The
+ * controller then reacts to `event.type` / `event.data` and returns 200 (so Accounts doesn't retry).
+ */
+export function verifyAndParseAccountsWebhook(
+	rawBody: string,
+	signatureHeaderValue: string | string[] | undefined,
+	secret: string
+): AccountsWebhookResult {
+	const signature = Array.isArray(signatureHeaderValue) ? signatureHeaderValue[0] : signatureHeaderValue;
+	if (!verifyWebhookSignature(rawBody, signature ?? null, secret)) {
+		return { ok: false, reason: 'bad_signature' };
+	}
+	try {
+		return { ok: true, event: normalizeAccountsWebhook(JSON.parse(rawBody)) };
+	} catch {
+		return { ok: false, reason: 'bad_json' };
+	}
+}
+
+// Re-export the shared normalizer so a Nest consumer that parses a dev/unsigned body itself can reuse it.
+export { normalizeAccountsWebhook };
+
+export type { ServiceKeyContext, AccountsClientConfig, AccountsWebhookEvent };

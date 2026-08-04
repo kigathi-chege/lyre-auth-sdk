@@ -13,6 +13,7 @@ import {
 	introspectServiceKey,
 	logoutFromAccounts,
 	readPlatformSessionCookie,
+	normalizeAccountsWebhook,
 	serviceKeyFromRequest,
 	verifyWebhookSignature,
 	type AccountsClientConfig,
@@ -219,7 +220,10 @@ export type AccountsWebhookOptions = {
 	secret: string;
 	/** Route to receive webhooks on. Default '/api/auth/accounts/webhook'. */
 	path?: string;
-	/** Header carrying the signature. Default 'x-accounts-signature'. */
+	/**
+	 * Header carrying the signature. Default 'x-webhook-signature' — the header the Accounts
+	 * webhook worker actually sends (HMAC-SHA256 hex of the raw body).
+	 */
 	signatureHeader?: string;
 	/** React to a verified event. Throwing yields a 500 (Accounts may retry). */
 	onEvent: (event: AccountsWebhookEvent, raw: string, request: RequestEvent) => void | Promise<void>;
@@ -231,7 +235,7 @@ function jsonResponse(status: number, body: Record<string, unknown>): Response {
 
 export function createAccountsWebhookHandle(opts: AccountsWebhookOptions): Handle {
 	const path = opts.path ?? '/api/auth/accounts/webhook';
-	const sigHeader = opts.signatureHeader ?? 'x-accounts-signature';
+	const sigHeader = opts.signatureHeader ?? 'x-webhook-signature';
 
 	return async ({ event, resolve }) => {
 		if (event.url.pathname !== path || event.request.method !== 'POST') return resolve(event);
@@ -241,15 +245,15 @@ export function createAccountsWebhookHandle(opts: AccountsWebhookOptions): Handl
 			return jsonResponse(401, { ok: false, error: 'Invalid webhook signature.' });
 		}
 
-		let payload: { type?: unknown };
+		let parsed: AccountsWebhookEvent;
 		try {
-			payload = JSON.parse(raw) as { type?: unknown };
+			parsed = normalizeAccountsWebhook(JSON.parse(raw));
 		} catch {
 			return jsonResponse(400, { ok: false, error: 'Invalid JSON body.' });
 		}
 
 		try {
-			await opts.onEvent({ ...(payload as object), type: String(payload.type ?? 'unknown') }, raw, event);
+			await opts.onEvent(parsed, raw, event);
 		} catch {
 			return jsonResponse(500, { ok: false, error: 'Webhook handler failed.' });
 		}
