@@ -5,7 +5,7 @@ and identity handling (HMAC-signed cookies, the accounts login → callback →
 logout exchange, tenant resolution), plus an optional turnkey **SvelteKit**
 adapter that wires it all up in a few lines.
 
-Ships as raw TypeScript source.
+Ships built ESM output from `dist/`, with type declarations.
 
 ## Install
 
