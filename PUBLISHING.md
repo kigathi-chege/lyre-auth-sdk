@@ -44,7 +44,14 @@ On npmjs.com, open **Settings → Trusted publishers → Add publisher**:
 
 - **Publisher**: GitHub Actions
 - **Organization or user**: `kigathi-chege`
-- **Repository**: `lyre-auth`
+- **Repository**: `lyre-auth-sdk`
+
+> **Note:** this doc previously said `lyre-auth`, which does not match the actual
+> git remote (`github.com/kigathi-chege/lyre-auth-sdk`). If the trusted publisher
+> on npmjs.com was configured from the old value, OIDC publishes from this repo
+> are being **rejected** — check **Settings → Trusted publishers** for
+> `@~lyre/auth` and correct the repository name there. Fixing this file alone
+> does not repair a misconfigured publisher.
 - **Workflow filename**: `publish.yml`
 - **Environment name**: `Home`
 
