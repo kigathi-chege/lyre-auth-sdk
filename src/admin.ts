@@ -75,12 +75,43 @@ export interface InviteResult {
 	[key: string]: unknown;
 }
 
+/**
+ * A profile field an app collects about a user — the spec a consumer renders a form input from.
+ * Mirrors Accounts' `fields` registry, so a consumer never hardcodes one app's idea of a person.
+ */
+export interface ProfileFieldSpec {
+	id: string;
+	fieldName: string;
+	label: string;
+	fieldType: string;
+	required: boolean;
+	hidden: boolean;
+	enumValues: string[] | null;
+	inputPrefix: string | null;
+	validationRegex: string | null;
+	validationMessage: string | null;
+	displayOrder: number;
+}
+
+/** Whether an email can be invited to an app. See `checkInviteEmail`. */
+export interface InviteEmailCheck {
+	email: string;
+	/** `member` = already has app access; `invited` = a live invite exists; `available` = go ahead. */
+	state: 'member' | 'invited' | 'available';
+	/** Whether an Accounts user already exists for this address (they keep their own profile). */
+	hasAccount: boolean;
+	/** When the pending invite lapses — only for `invited`. */
+	expiresAt?: string;
+}
+
 /** A pending (not yet accepted, not yet expired) app invitation. */
 export interface PendingInvite {
 	id: string;
 	email: string;
 	/** The workspace the invitee joins on acceptance; null for a group-less invite. */
 	userGroupId: string | null;
+	/** Values captured on the invite form, keyed by field name. Prefills the accept form. */
+	profileData?: Record<string, string>;
 	createdAt: string;
 	expiresAt: string;
 	/** The inviter's email, when still resolvable. */
@@ -195,12 +226,45 @@ export class AccountsAdmin {
 	 */
 	async inviteToApp(
 		appSlug: string,
-		input: { email: string; userGroupId?: string | null }
+		input: {
+			email: string;
+			userGroupId?: string | null;
+			/** Profile values from the invite form, keyed by field name (see `listAppProfileFields`).
+			 *  Accounts drops any key the app does not collect, so authorization-shaped values
+			 *  (role, assignability) can never be set from here. */
+			profileData?: Record<string, string> | null;
+		}
 	): Promise<InviteResult> {
 		return this.request<InviteResult>('POST', `/api/auth/apps/${encodeURIComponent(appSlug)}/invites`, {
 			auth: 'session',
 			body: input
 		});
+	}
+
+	/**
+	 * The profile fields this app collects about a user — the spec to render an invite form from.
+	 * Session-authed. Never includes email: that is the invite's identity, not a profile value.
+	 */
+	async listAppProfileFields(appSlug: string): Promise<ProfileFieldSpec[]> {
+		const data = await this.request<{ fields?: ProfileFieldSpec[] }>(
+			'GET',
+			`/api/auth/apps/${encodeURIComponent(appSlug)}/profile-fields`,
+			{ auth: 'session' }
+		);
+		return data.fields ?? [];
+	}
+
+	/**
+	 * Whether an email can be invited — for a live check on an invite form, so the inviter learns
+	 * BEFORE submitting that someone is already a member or already invited. Email only, exact match.
+	 * Session-authed.
+	 */
+	async checkInviteEmail(appSlug: string, email: string): Promise<InviteEmailCheck> {
+		return this.request<InviteEmailCheck>(
+			'GET',
+			`/api/auth/apps/${encodeURIComponent(appSlug)}/invites/lookup?email=${encodeURIComponent(email)}`,
+			{ auth: 'session' }
+		);
 	}
 
 	/** Revoke a pending invite (withdraw one sent in error). Session-authed. */
