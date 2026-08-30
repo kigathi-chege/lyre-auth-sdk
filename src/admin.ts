@@ -66,10 +66,25 @@ export interface AppMember {
 }
 
 export interface InviteResult {
-	/** `added` = the email already had an Accounts user and was granted app access immediately;
-	 *  `invited` = a new invite was created and an accept link emailed. */
-	status: 'added' | 'invited';
+	/** `invited` = an invite was created and an accept link emailed;
+	 *  `already_member` = that email already has access to the app (returned with HTTP 409).
+	 *  (`added` is legacy: Accounts no longer grants access without acceptance.) */
+	status: 'invited' | 'already_member' | 'added';
+	/** The workspace the invitee joins on acceptance, echoed back; null when none was requested. */
+	userGroupId?: string | null;
 	[key: string]: unknown;
+}
+
+/** A pending (not yet accepted, not yet expired) app invitation. */
+export interface PendingInvite {
+	id: string;
+	email: string;
+	/** The workspace the invitee joins on acceptance; null for a group-less invite. */
+	userGroupId: string | null;
+	createdAt: string;
+	expiresAt: string;
+	/** The inviter's email, when still resolvable. */
+	invitedByEmail?: string | null;
 }
 
 export interface GroupMember {
@@ -169,13 +184,32 @@ export class AccountsAdmin {
 
 	// ── App membership (invite / list / remove) ─────────────────────────────────
 
-	/** Invite an email to an app: adds an existing Accounts user immediately, else emails an accept
-	 *  link. Session-authed (caller must have access to the app). */
-	async inviteToApp(appSlug: string, input: { email: string }): Promise<InviteResult> {
+	/**
+	 * Invite an email to an app, emailing them an accept link. Session-authed (the caller must have
+	 * access to the app).
+	 *
+	 * Pass `userGroupId` to say which WORKSPACE the invitee joins when they accept. Omit it and they
+	 * join the app but no workspace — Accounts then treats them as a brand-new user on first login and
+	 * sends them to create their own, instead of landing in the workspace that invited them. Accounts
+	 * validates the group against the CALLER's own memberships, so this cannot target a foreign group.
+	 */
+	async inviteToApp(
+		appSlug: string,
+		input: { email: string; userGroupId?: string | null }
+	): Promise<InviteResult> {
 		return this.request<InviteResult>('POST', `/api/auth/apps/${encodeURIComponent(appSlug)}/invites`, {
 			auth: 'session',
 			body: input
 		});
+	}
+
+	/** Revoke a pending invite (withdraw one sent in error). Session-authed. */
+	async revokeAppInvite(appSlug: string, inviteId: string): Promise<void> {
+		await this.request<unknown>(
+			'DELETE',
+			`/api/auth/apps/${encodeURIComponent(appSlug)}/invites?inviteId=${encodeURIComponent(inviteId)}`,
+			{ auth: 'session' }
+		);
 	}
 
 	/** Everyone with access to an app. Session-authed. */
@@ -200,14 +234,65 @@ export class AccountsAdmin {
 	// ── Groups (agent picker) ───────────────────────────────────────────────────
 
 	/** Members of a user_group (the workspace's agents). Service-key authed (`stats:read`). */
-	async listGroupMembers(groupId: string, opts: { appId?: string } = {}): Promise<GroupMember[]> {
-		const suffix = opts.appId ? `?appId=${encodeURIComponent(opts.appId)}` : '';
-		const data = await this.request<{ members?: GroupMember[] }>(
+	async listGroupMembers(
+		groupId: string,
+		opts: { appId?: string; search?: string; limit?: number; offset?: number } = {}
+	): Promise<GroupMember[]> {
+		const { members } = await this.listGroupMembersPage(groupId, opts);
+		return members;
+	}
+
+	/**
+	 * A PAGE of a group's members, plus the total before paging — what a paginated, searchable user
+	 * list needs. `listGroupMembers` stays the "give me everyone" convenience for the agent picker.
+	 *
+	 * Search and paging are applied by Accounts in SQL: fetching every member to filter in the browser
+	 * does not scale, and leaves the pager unable to know how many pages exist. Omit `limit` and the
+	 * full list comes back (with `totalCount` equal to its length).
+	 */
+	async listGroupMembersPage(
+		groupId: string,
+		opts: { appId?: string; search?: string; limit?: number; offset?: number } = {}
+	): Promise<{ members: GroupMember[]; totalCount: number }> {
+		const qs = new URLSearchParams();
+		if (opts.appId) qs.set('appId', opts.appId);
+		if (opts.search) qs.set('search', opts.search);
+		if (opts.limit !== undefined) qs.set('limit', String(opts.limit));
+		if (opts.offset !== undefined) qs.set('offset', String(opts.offset));
+		const suffix = qs.size ? `?${qs}` : '';
+		const data = await this.request<{ members?: GroupMember[]; totalCount?: number }>(
 			'GET',
 			`/api/auth/user-groups/${encodeURIComponent(groupId)}/members${suffix}`,
 			{ auth: 'key' }
 		);
-		return data.members ?? [];
+		const members = data.members ?? [];
+		return { members, totalCount: data.totalCount ?? members.length };
+	}
+
+	/**
+	 * The app's PENDING invites — people invited but not yet accepted. Session-authed.
+	 *
+	 * An invitee is not a membership, so they appear in no member list; without this a successful
+	 * invite looks like nothing happened until the person accepts. Pass `userGroupId` to scope to one
+	 * workspace. Accounts excludes consumed and expired invites.
+	 */
+	async listAppInvites(
+		appSlug: string,
+		opts: { userGroupId?: string; search?: string; limit?: number; offset?: number } = {}
+	): Promise<{ invites: PendingInvite[]; totalCount: number }> {
+		const qs = new URLSearchParams();
+		if (opts.userGroupId) qs.set('userGroupId', opts.userGroupId);
+		if (opts.search) qs.set('search', opts.search);
+		if (opts.limit !== undefined) qs.set('limit', String(opts.limit));
+		if (opts.offset !== undefined) qs.set('offset', String(opts.offset));
+		const suffix = qs.size ? `?${qs}` : '';
+		const data = await this.request<{ invites?: PendingInvite[]; totalCount?: number }>(
+			'GET',
+			`/api/auth/apps/${encodeURIComponent(appSlug)}/invites${suffix}`,
+			{ auth: 'session' }
+		);
+		const invites = data.invites ?? [];
+		return { invites, totalCount: data.totalCount ?? invites.length };
 	}
 
 	// ── App-scoped profile (availability / sound / any per-app preference) ───────
