@@ -267,6 +267,38 @@ export class AccountsAdmin {
 		);
 	}
 
+	/**
+	 * Add a user to a workspace group. Service-key authed (`users:write`).
+	 *
+	 * Membership was read-only over the API, which is why "reactivate user" had to fall back to
+	 * re-INVITING an existing colleague. Use this to restore membership instead.
+	 */
+	async addGroupMember(
+		groupId: string,
+		userId: string,
+		opts: { role?: string } = {}
+	): Promise<void> {
+		await this.request<unknown>(
+			'POST',
+			`/api/auth/user-groups/${encodeURIComponent(groupId)}/members`,
+			{ auth: 'key', body: { userId, ...(opts.role ? { role: opts.role } : {}) } }
+		);
+	}
+
+	/**
+	 * Remove a user from a workspace group. Service-key authed (`users:write`). Idempotent.
+	 *
+	 * Removing a user's APP access does NOT remove their group membership, and the members list
+	 * reads membership — so without this a "deleted" user keeps reappearing in the workspace.
+	 */
+	async removeGroupMember(groupId: string, userId: string): Promise<void> {
+		await this.request<unknown>(
+			'DELETE',
+			`/api/auth/user-groups/${encodeURIComponent(groupId)}/members?userId=${encodeURIComponent(userId)}`,
+			{ auth: 'key' }
+		);
+	}
+
 	/** Revoke a pending invite (withdraw one sent in error). Session-authed. */
 	async revokeAppInvite(appSlug: string, inviteId: string): Promise<void> {
 		await this.request<unknown>(
@@ -284,6 +316,20 @@ export class AccountsAdmin {
 			{ auth: 'session' }
 		);
 		return data.users ?? [];
+	}
+
+	/**
+	 * Restore an existing user's access to an app. Session-authed. Idempotent.
+	 *
+	 * The counterpart to `removeAppUser`. Distinct from `inviteToApp`: this is for an account that
+	 * already exists and already consented, so it must NOT put the person through registration again.
+	 */
+	async addAppUser(appSlug: string, userId: string): Promise<void> {
+		await this.request<unknown>(
+			'POST',
+			`/api/auth/apps/${encodeURIComponent(appSlug)}/users`,
+			{ auth: 'session', body: { userId } }
+		);
 	}
 
 	/** Revoke a user's access to an app. Session-authed. */
