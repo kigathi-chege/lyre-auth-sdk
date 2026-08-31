@@ -104,6 +104,15 @@ export interface InviteEmailCheck {
 	expiresAt?: string;
 }
 
+/** A workspace (user_group) with its app-scoped profile values. */
+export interface WorkspaceProfile {
+	id: string;
+	slug: string;
+	displayName: string;
+	/** App-scoped values keyed by field name — e.g. `support_email`. Empty when no app was scoped. */
+	profileData: Record<string, string>;
+}
+
 /** A pending (not yet accepted, not yet expired) app invitation. */
 export interface PendingInvite {
 	id: string;
@@ -242,13 +251,19 @@ export class AccountsAdmin {
 	}
 
 	/**
-	 * The profile fields this app collects about a user — the spec to render an invite form from.
-	 * Session-authed. Never includes email: that is the invite's identity, not a profile value.
+	 * The profile fields this app collects about a SUBJECT — the spec to render a form from.
+	 * `ownerType: 'user'` (default) is what an invite form collects about a person; `'user_group'` is
+	 * what a workspace's edit form collects about itself. Session-authed. A user's email is never
+	 * included: that is identity, not a profile value.
 	 */
-	async listAppProfileFields(appSlug: string): Promise<ProfileFieldSpec[]> {
+	async listAppProfileFields(
+		appSlug: string,
+		ownerType: 'user' | 'user_group' = 'user'
+	): Promise<ProfileFieldSpec[]> {
+		const suffix = ownerType === 'user_group' ? '?ownerType=user_group' : '';
 		const data = await this.request<{ fields?: ProfileFieldSpec[] }>(
 			'GET',
-			`/api/auth/apps/${encodeURIComponent(appSlug)}/profile-fields`,
+			`/api/auth/apps/${encodeURIComponent(appSlug)}/profile-fields${suffix}`,
 			{ auth: 'session' }
 		);
 		return data.fields ?? [];
@@ -264,6 +279,41 @@ export class AccountsAdmin {
 			'GET',
 			`/api/auth/apps/${encodeURIComponent(appSlug)}/invites/lookup?email=${encodeURIComponent(email)}`,
 			{ auth: 'session' }
+		);
+	}
+
+	/**
+	 * A workspace's own details — name plus its app-scoped profile values (support email, …).
+	 * Service-key authed (`stats:read`). Pass `appId` to scope the profile values.
+	 *
+	 * Workspace details live in Accounts, which owns the group. Consumers previously had no way to
+	 * read them and fell back to a retiring legacy system's copy.
+	 */
+	async getUserGroup(
+		groupId: string,
+		opts: { appId?: string } = {}
+	): Promise<WorkspaceProfile> {
+		const suffix = opts.appId ? `?appId=${encodeURIComponent(opts.appId)}` : '';
+		return this.request<WorkspaceProfile>(
+			'GET',
+			`/api/auth/user-groups/${encodeURIComponent(groupId)}${suffix}`,
+			{ auth: 'key' }
+		);
+	}
+
+	/**
+	 * Update a workspace's name and/or its app-scoped profile values. Service-key authed
+	 * (`users:write`). An empty profile value CLEARS that field rather than storing an empty string.
+	 * Accounts drops any key the app does not declare for `user_group`.
+	 */
+	async updateUserGroup(
+		groupId: string,
+		input: { displayName?: string; profileData?: Record<string, string>; appId?: string }
+	): Promise<WorkspaceProfile> {
+		return this.request<WorkspaceProfile>(
+			'PATCH',
+			`/api/auth/user-groups/${encodeURIComponent(groupId)}`,
+			{ auth: 'key', body: input }
 		);
 	}
 
