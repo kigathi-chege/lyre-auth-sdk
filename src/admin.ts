@@ -349,6 +349,33 @@ export class AccountsAdmin {
 		);
 	}
 
+	/**
+	 * Deactivate or reactivate a user account GLOBALLY. Service-key authed (`users:write`).
+	 *
+	 * `disabled: true` sets `users.disabled_at`; `false` clears it. A disabled user cannot
+	 * authenticate by ANY route (password, OAuth exchange, token) across EVERY app — this is an
+	 * account-level gate, not a per-workspace one. Their rows are retained, so anything they own
+	 * (audit history, assigned tickets, migrated connections) keeps a valid owner.
+	 *
+	 * Accounts also revokes their live sessions across every tenant and emits `session.revoked`, so
+	 * deactivation takes effect immediately rather than whenever the last session happens to expire.
+	 *
+	 * This is the counterpart to `removeGroupMember`, NOT a synonym for it. Removing a membership
+	 * deletes the row the members list is built from, so the person disappears and can never be
+	 * reactivated from the UI; disabling keeps them listed with `disabledAt` set, which is what the
+	 * Active/Deactivated badge reads.
+	 */
+	async setUserDisabled(userId: string, disabled: boolean): Promise<void> {
+		await this.request<unknown>(
+			'PATCH',
+			`/api/auth/admin/users/${encodeURIComponent(userId)}`,
+			{
+				auth: 'key',
+				body: { disabledAt: disabled ? new Date().toISOString() : null }
+			}
+		);
+	}
+
 	/** Revoke a pending invite (withdraw one sent in error). Session-authed. */
 	async revokeAppInvite(appSlug: string, inviteId: string): Promise<void> {
 		await this.request<unknown>(
