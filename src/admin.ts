@@ -227,11 +227,23 @@ export class AccountsAdmin {
 		});
 	}
 
-	/** Change the signed-in user's password. Session-authed; Accounts verifies `currentPassword` and,
-	 *  with `revokeOtherSessions`, logs the user out everywhere else. The target is the session's own
-	 *  user — no id is passed. */
+	/** Set or change the signed-in user's password. Session-authed; the target is the session's own
+	 *  user — no id is passed.
+	 *
+	 *  ONE call serves both cases. Accounts reads the credential and decides: with none it SETS the
+	 *  password (no `currentPassword` required); with one it verifies `currentPassword` and CHANGES
+	 *  it. The result's `mode` says which happened. With `revokeOtherSessions`, the user is logged
+	 *  out everywhere else. */
 	async changePassword(input: {
-		currentPassword: string;
+		/**
+		 * OPTIONAL, and omitted when the account has no password yet — someone who signed up with
+		 * Google has none to verify. Accounts decides which case applies by reading the credential
+		 * itself (`setOrChangePassword`), so omitting this cannot bypass verification: when a
+		 * password DOES exist and this is absent, the request is rejected.
+		 *
+		 * Read `hasPassword` from the `/me` payload to decide whether to collect it.
+		 */
+		currentPassword?: string;
 		newPassword: string;
 		confirmPassword?: string;
 		revokeOtherSessions?: boolean;
