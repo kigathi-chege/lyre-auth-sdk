@@ -133,7 +133,34 @@ export interface GroupMember {
 	name?: string | null;
 	firstName?: string | null;
 	lastName?: string | null;
+	/**
+	 * The group MEMBERSHIP role (`owner` / `admin` / `member`) — how this person relates to the
+	 * workspace itself. NOT the app's account type; see `appRoles`.
+	 */
 	role?: string | null;
+	/**
+	 * The app's own RBAC roles for this member, scoped to this group (e.g. `engage:admin`,
+	 * `engage:agent`). This is what "account type" means to a consumer, and what an account-type
+	 * change writes. Empty when the member holds no group-scoped app role.
+	 */
+	appRoles?: string[];
+	/** Set when the account is deactivated in Accounts; null for an active account. */
+	disabledAt?: string | null;
+	/** When the user account was created (ISO). */
+	createdAt?: string | null;
+	/**
+	 * Last sign-in (ISO), or null for someone who has never signed in.
+	 *
+	 * Derived from `MAX(sessions.last_seen_at)` — the definition Accounts uses everywhere else for
+	 * this question. There is no separate `last_login_at` column.
+	 */
+	lastSeenAt?: string | null;
+	/**
+	 * App-scoped profile values (`phone_number`, `assignable`, `availability`, …). Present only when
+	 * the request passed an `appId`; profile data is app-scoped by definition. Values are strings —
+	 * the store is an EAV of text — so a boolean reads as `'true'` / `'false'`.
+	 */
+	profileData?: Record<string, string>;
 }
 
 /** Thrown on a non-2xx Accounts response so callers can surface the upstream message + status. */
@@ -242,6 +269,33 @@ export class AccountsAdmin {
 			 *  Accounts drops any key the app does not collect, so authorization-shaped values
 			 *  (role, assignability) can never be set from here. */
 			profileData?: Record<string, string> | null;
+			/**
+			 * The inviting app's OAuth callback — where accepting the invite should land the invitee.
+			 *
+			 * Acceptance hands off to `/auth/authorize`, which requires a redirect_uri it can validate
+			 * against the app's authorized list; without one the invitee reaches the gateway app
+			 * chooser instead of the app that invited them. Must already be in that allowlist — an
+			 * unauthorized value is rejected at invite time (400) rather than stored.
+			 */
+			redirectUri?: string | null;
+			/**
+			 * The roles to grant when this invite is accepted, overriding the app's configured default
+			 * invite roles. Role IDS resolved by the caller from its own vocabulary — Accounts has no
+			 * notion of "admin" or "agent".
+			 *
+			 * A LIST because one account type commonly means several roles. Each id is validated as
+			 * grantable by the inviting app at invite time (400 if not), so a bad invite fails the
+			 * person creating it rather than the person accepting it.
+			 */
+			invitedRoleIds?: string[] | null;
+			/**
+			 * App-scoped `assignable` default, written to the invitee's profile on acceptance.
+			 *
+			 * A COLUMN on the invite, not a `profileData` key: it is authorization (whether work can be
+			 * routed to this person) and the profile bag is invitee-editable, so Accounts drops it from
+			 * there by design. Omit to leave unset — readers treat missing as assignable.
+			 */
+			assignable?: boolean | null;
 		}
 	): Promise<InviteResult> {
 		return this.request<InviteResult>('POST', `/api/auth/apps/${encodeURIComponent(appSlug)}/invites`, {
