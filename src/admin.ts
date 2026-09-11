@@ -96,7 +96,13 @@ export interface ProfileFieldSpec {
 /** Whether an email can be invited to an app. See `checkInviteEmail`. */
 export interface InviteEmailCheck {
 	email: string;
-	/** `member` = already has app access; `invited` = a live invite exists; `available` = go ahead. */
+	/**
+	 * `member` = already in scope; `invited` = a live invite exists; `available` = go ahead.
+	 *
+	 * SCOPE depends on whether `userGroupId` was passed: with one, each state is about that
+	 * WORKSPACE; without, about the app as a whole. For a multi-workspace app the app-level answer is
+	 * usually the wrong one — someone in another workspace is not a member of this one.
+	 */
 	state: 'member' | 'invited' | 'available';
 	/** Whether an Accounts user already exists for this address (they keep their own profile). */
 	hasAccount: boolean;
@@ -340,10 +346,20 @@ export class AccountsAdmin {
 	 * BEFORE submitting that someone is already a member or already invited. Email only, exact match.
 	 * Session-authed.
 	 */
-	async checkInviteEmail(appSlug: string, email: string): Promise<InviteEmailCheck> {
+	async checkInviteEmail(
+		appSlug: string,
+		email: string,
+		opts?: { userGroupId?: string | null }
+	): Promise<InviteEmailCheck> {
+		// Pass the WORKSPACE whenever the caller knows it — `inviteToApp` already takes one, and the
+		// two must ask the same question or the form blocks an invite the server would accept.
+		// Optional, so existing callers keep the app-wide behaviour unchanged.
+		const query = new URLSearchParams({ email });
+		if (opts?.userGroupId) query.set('userGroupId', opts.userGroupId);
+
 		return this.request<InviteEmailCheck>(
 			'GET',
-			`/api/auth/apps/${encodeURIComponent(appSlug)}/invites/lookup?email=${encodeURIComponent(email)}`,
+			`/api/auth/apps/${encodeURIComponent(appSlug)}/invites/lookup?${query.toString()}`,
 			{ auth: 'session' }
 		);
 	}
