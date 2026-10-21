@@ -240,7 +240,9 @@ export async function exchangeAuthorizationCode(input: {
 	code: string;
 	fetchImpl?: typeof fetch;
 }): Promise<AccountsTokenResponse> {
-	if (input.config.useMock || input.code.startsWith('demo_')) {
+	// Only a mock-mode config may mint the mock identity. A `demo_` code reaching a
+	// real config is forged: anyone can put one in the callback URL.
+	if (input.config.useMock) {
 		return createMockTokenResponse(input.code);
 	}
 
