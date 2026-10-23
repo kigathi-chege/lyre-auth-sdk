@@ -7,24 +7,36 @@ import { createHash } from 'node:crypto';
 import { type Handle, type RequestEvent } from '@sveltejs/kit';
 import {
 	beginAccountsLoginRedirect,
+	clearLoginStateCookie,
 	clearPlatformSessionCookie,
+	createLoginStateCookie,
+	createOidcClientFromConfig,
+	createPlatformSessionCookie,
 	handleAccountsCallback,
+	identityFromClaims,
 	identityPassthroughSync,
 	introspectServiceKey,
-	logoutFromAccounts,
+	isOidcError,
+	readLoginStateCookie,
 	readPlatformSessionCookie,
 	normalizeAccountsWebhook,
+	safeNextPath,
 	serviceKeyFromRequest,
 	verifyWebhookSignature,
 	type AccountsClientConfig,
 	type AccountsWebhookEvent,
 	type CookieOptions,
+	type OidcClient,
+	type OidcClientOptions,
+	type OidcError,
 	type PlatformSession,
 	type ServiceKeyContext,
-	type SyncAccountsUser
+	type SyncAccountsUser,
+	type TokenSet
 } from './index';
 
-const STATE_COOKIE = 'accounts_auth_state';
+const STATE_COOKIE = 'accounts_auth_state'; // legacy (mock-mode) login state
+const REFRESH_SKEW_MS = 60_000;
 
 // Build a 302 redirect Response that also sets cookies (the core functions return
 // ready-made Set-Cookie strings). Multiple cookies via repeated `set-cookie` headers.
@@ -61,6 +73,23 @@ export type SvelteKitAuthOptions = {
 	 * recommended in production, since the session payload includes tenant memberships.
 	 */
 	sessionSecret?: string;
+	/** OIDC client overrides (issuer, scopes, discovery, endpoints, tokenEndpointAuthMethod…). Added 0.12.0. */
+	oidc?: Partial<OidcClientOptions>;
+	/** A prebuilt client; takes precedence over `config` + `oidc`. Added 0.12.0. */
+	client?: OidcClient;
+	fetchImpl?: typeof fetch;
+	/**
+	 * Refresh the Accounts access token when it is within 60s of expiry and the session holds a
+	 * refresh token. Default true. A refused refresh (reused/revoked token) logs the session out.
+	 */
+	refreshTokens?: boolean;
+	/**
+	 * After local sign-out, send the browser to Accounts' `/auth/logout` to end the Accounts session
+	 * too (returning to `config.logoutRedirectUri`). Default false: only this app signs out.
+	 */
+	endAccountsSession?: boolean;
+	/** Render a failed callback. Default: a plain 400 naming the OidcError code. */
+	onAuthError?: (error: unknown, event: RequestEvent) => Response | Promise<Response>;
 };
 
 // Apps should augment App.Locals with these. We set them on every request.
@@ -77,13 +106,53 @@ export function createAuthHandle(opts: SvelteKitAuthOptions): Handle {
 	const postLogoutPath = opts.postLogoutPath ?? '/';
 	const cookieOptions = opts.cookieOptions;
 	const sessionSecret = opts.sessionSecret;
+	const mock = Boolean(opts.config.useMock) && !opts.client;
+	const refreshTokens = opts.refreshTokens ?? true;
+
+	let client: OidcClient | null = opts.client ?? null;
+	const getClient = () =>
+		(client ??= createOidcClientFromConfig(opts.config, { fetchImpl: opts.fetchImpl, ...opts.oidc }));
+
+	// Refresh tokens rotate and a reused one revokes its whole family, so two concurrent requests
+	// must never both spend the same refresh token. Share one in-flight refresh per token and keep
+	// its result briefly for requests that still carry the old cookie. (Per process: behind several
+	// instances, use sticky sessions or keep tokens server-side.)
+	const refreshes = new Map<string, { promise: Promise<TokenSet>; expires: number }>();
+	function refreshOnce(refreshToken: string): Promise<TokenSet> {
+		const key = createHash('sha256').update(refreshToken).digest('hex');
+		const now = Date.now();
+		for (const [k, v] of refreshes) if (v.expires <= now) refreshes.delete(k);
+		const hit = refreshes.get(key);
+		if (hit) return hit.promise;
+		const promise = getClient().refresh(refreshToken);
+		refreshes.set(key, { promise, expires: now + 30_000 });
+		promise.catch(() => refreshes.delete(key));
+		return promise;
+	}
+
+	const authError = async (error: unknown, event: RequestEvent): Promise<Response> => {
+		const response = opts.onAuthError
+			? await opts.onAuthError(error, event)
+			: new Response(`Sign-in failed (${isOidcError(error) ? (error as OidcError).code : 'error'}).`, {
+					status: 400,
+					headers: { 'content-type': 'text/plain; charset=utf-8' }
+				});
+		try {
+			response.headers.append('set-cookie', clearLoginStateCookie(cookieOptions));
+		} catch {
+			/* immutable headers: the cookie expires on its own in 10 minutes */
+		}
+		return response;
+	};
 
 	return async ({ event, resolve }) => {
-		const session = readPlatformSessionCookie(event.request.headers.get('cookie'), {
-			secret: sessionSecret
-		});
-		(event.locals as PlatformLocals).session = session;
-		(event.locals as PlatformLocals).principal = session.principal;
+		const cookieHeader = event.request.headers.get('cookie');
+		let session = readPlatformSessionCookie(cookieHeader, { secret: sessionSecret });
+		const setLocals = () => {
+			(event.locals as PlatformLocals).session = session;
+			(event.locals as PlatformLocals).principal = session.principal;
+		};
+		setLocals();
 
 		const path = event.url.pathname;
 
@@ -92,51 +161,118 @@ export function createAuthHandle(opts: SvelteKitAuthOptions): Handle {
 		// strings the core functions return). Setting event.cookies + throwing a redirect
 		// from inside `handle` does not reliably flush cookies, so we don't rely on that.
 		if (path === loginPath) {
-			const next = event.url.searchParams.get('next') ?? '/';
-			const flow = beginAccountsLoginRedirect(opts.config, { nextPath: next, cookieOptions });
-			return redirectWithCookies(flow.redirectUrl, [flow.stateCookie]);
+			const next = safeNextPath(event.url.searchParams.get('next'));
+			if (mock) {
+				const flow = beginAccountsLoginRedirect(opts.config, { nextPath: next, cookieOptions });
+				return redirectWithCookies(flow.redirectUrl, [flow.stateCookie]);
+			}
+			const login = await getClient().beginLogin();
+			return redirectWithCookies(login.url, [
+				createLoginStateCookie(login, { nextPath: next, secret: sessionSecret, cookieOptions })
+			]);
 		}
 
 		if (path === callbackPath) {
-			const code = event.url.searchParams.get('code') ?? '';
-			const state = event.url.searchParams.get('state') ?? '';
-			const storedState = event.cookies.get(STATE_COOKIE);
-			const result = await handleAccountsCallback({
-				config: opts.config,
-				code,
-				state,
-				storedState,
-				syncAccountsUser: sync,
-				cookieOptions,
-				secret: sessionSecret
-			});
-			return redirectWithCookies(result.nextPath || '/', [
-				result.sessionCookie,
-				result.clearStateCookie
-			]);
+			if (mock) {
+				const result = await handleAccountsCallback({
+					config: opts.config,
+					code: event.url.searchParams.get('code') ?? '',
+					state: event.url.searchParams.get('state') ?? '',
+					storedState: event.cookies.get(STATE_COOKIE),
+					syncAccountsUser: sync,
+					cookieOptions,
+					secret: sessionSecret
+				});
+				return redirectWithCookies(result.nextPath || '/', [result.sessionCookie, result.clearStateCookie]);
+			}
+			const stored = readLoginStateCookie(cookieHeader, { secret: sessionSecret });
+			try {
+				const { claims, tokens } = await getClient().handleCallback({ url: event.url, expected: stored });
+				const identity = identityFromClaims(claims);
+				const local = await sync(identity);
+				const next: PlatformSession = {
+					principal: {
+						identity,
+						user: local.user,
+						tenantAccess: { activeTenantId: local.activeTenantId, memberships: local.memberships }
+					},
+					tenant: null,
+					accessToken: tokens.accessToken,
+					refreshToken: tokens.refreshToken,
+					expiresAt: new Date(tokens.expiresAt).toISOString()
+				};
+				return redirectWithCookies(stored?.nextPath ?? '/', [
+					createPlatformSessionCookie(next, cookieOptions, sessionSecret),
+					clearLoginStateCookie(cookieOptions)
+				]);
+			} catch (error) {
+				return authError(error, event);
+			}
 		}
 
 		if (path === logoutPath) {
-			// Revoke the session upstream (best-effort) BEFORE clearing the local cookie, so logging out
-			// here also invalidates the Accounts session — not just this app's cookie. `?all=1` logs the
-			// user out of every device.
-			if (session.accessToken) {
-				const all = event.url.searchParams.get('all') === '1' || event.url.searchParams.get('all') === 'true';
-				await logoutFromAccounts({ config: opts.config, accessToken: session.accessToken, all });
+			// Revoke the refresh token (best-effort) so it cannot be used again, then end the local
+			// session; optionally end the Accounts session too.
+			let location = postLogoutPath;
+			if (!mock) {
+				if (session.refreshToken) {
+					await getClient()
+						.revoke(session.refreshToken, 'refresh_token')
+						.catch(() => undefined);
+				}
+				if (opts.endAccountsSession) {
+					location = await getClient()
+						.logoutUrl()
+						.catch(() => postLogoutPath);
+				}
 			}
-			return redirectWithCookies(postLogoutPath, [
+			return redirectWithCookies(location, [
 				clearPlatformSessionCookie(cookieOptions),
+				clearLoginStateCookie(cookieOptions),
 				`${STATE_COOKIE}=; ${cookieOptions?.sameSite === 'none' ? 'Path=/; HttpOnly; SameSite=None; Secure' : 'Path=/; HttpOnly; SameSite=Lax'}; Max-Age=0`
 			]);
+		}
+
+		// ── keep the Accounts access token fresh ──
+		let sessionCookieUpdate: string | null = null;
+		if (
+			!mock &&
+			refreshTokens &&
+			session.principal &&
+			session.refreshToken &&
+			(!session.expiresAt || Date.parse(session.expiresAt) - Date.now() < REFRESH_SKEW_MS)
+		) {
+			try {
+				const tokens = await refreshOnce(session.refreshToken);
+				session = {
+					...session,
+					accessToken: tokens.accessToken,
+					// Rotation: always keep the NEW refresh token; the old one is dead.
+					refreshToken: tokens.refreshToken,
+					expiresAt: new Date(tokens.expiresAt).toISOString()
+				};
+				sessionCookieUpdate = createPlatformSessionCookie(session, cookieOptions, sessionSecret);
+			} catch (error) {
+				if (isOidcError(error, 'token_request_failed') && (error as OidcError).status && (error as OidcError).status! < 500) {
+					// Refused (expired, revoked, or reused → family revoked): the session is over.
+					session = { principal: null, tenant: null };
+					sessionCookieUpdate = clearPlatformSessionCookie(cookieOptions);
+				}
+				// Transport/5xx: keep the session; try again on the next request.
+			}
+			setLocals();
 		}
 
 		// ── gate protected paths ──
 		if (opts.protect && opts.protect(event) && !session.principal) {
 			if (path.startsWith('/api')) {
-				return new Response(JSON.stringify({ message: 'Authentication required.' }), {
-					status: 401,
-					headers: { 'content-type': 'application/json' }
-				});
+				return withCookie(
+					new Response(JSON.stringify({ message: 'Authentication required.' }), {
+						status: 401,
+						headers: { 'content-type': 'application/json' }
+					}),
+					sessionCookieUpdate
+				);
 			}
 			// RETURN a real 302 Response (not `throw redirect(...)`). When this package is consumed as an
 			// externalized dependency, a thrown `redirect()` is a `Redirect` from node_modules' copy of
@@ -144,11 +280,27 @@ export function createAuthHandle(opts: SvelteKitAuthOptions): Handle {
 			// OWN copy — so the check fails and the redirect is coalesced into a fatal 500. Returning a
 			// Response (as the login/callback/logout branches already do) is handled verbatim by the host,
 			// so a 302 stays a 302 regardless of bundling.
-			return redirectWithCookies(`${loginPath}?next=${encodeURIComponent(path + event.url.search)}`, []);
+			return redirectWithCookies(
+				`${loginPath}?next=${encodeURIComponent(path + event.url.search)}`,
+				sessionCookieUpdate ? [sessionCookieUpdate] : []
+			);
 		}
 
-		return resolve(event);
+		return withCookie(await resolve(event), sessionCookieUpdate);
 	};
+}
+
+function withCookie(response: Response, cookie: string | null): Response {
+	if (!cookie) return response;
+	try {
+		response.headers.append('set-cookie', cookie);
+		return response;
+	} catch {
+		// Immutable headers (e.g. a proxied fetch Response): copy it.
+		const copy = new Response(response.body, response);
+		copy.headers.append('set-cookie', cookie);
+		return copy;
+	}
 }
 
 // ── App-scoped API key handle ────────────────────────────────────────────────────

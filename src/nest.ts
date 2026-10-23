@@ -10,6 +10,10 @@
 
 import { createHash } from 'node:crypto';
 import {
+	createAccessTokenVerifier,
+	looksLikeJwt,
+	type AccessTokenVerifier,
+	type AccessTokenVerifierOptions,
 	introspectServiceKey,
 	normalizeAccountsWebhook,
 	scopeSatisfied,
@@ -107,27 +111,46 @@ export function createServiceKeyResolver(opts: ServiceKeyResolverOptions) {
 }
 
 // ── User-session resolver ────────────────────────────────────────────────────────
-// A service that receives a raw Accounts session bearer (rather than holding its own signed
-// cookie, as the SvelteKit adapter does) verifies it by asking Accounts. `GET /api/auth/me`
-// returns the user plus `session.appId` / `session.tenantId`, which is what lets a service scope
-// a request to (user, app) from the token alone.
+// A service that receives an Accounts access token (rather than holding its own signed cookie, as
+// the SvelteKit adapter does) verifies it. Since 0.12.0 access tokens are RS256 JWTs, verified
+// locally against the Accounts JWKS: no round trip. `aud` names the app the token was issued for,
+// `tid` the tenant, `sid` the Accounts session. If the JWKS cannot be reached, Accounts' userinfo
+// endpoint vouches for the token instead. An opaque (non-JWT) bearer is a pre-0.12 session id and
+// is checked with the legacy `GET /api/auth/me` while `legacySessionTokens` is on.
 
 export type UserSessionContext = {
 	userId: string;
 	email?: string;
 	name?: string;
+	/** Accounts session id (`sid`). Empty when the token carries none. */
 	sessionId: string;
-	/** The app the session was issued for. Null for sessions created outside an app context. */
+	/** The app (client id) the token was issued for: the JWT `aud`. */
 	appId: string | null;
 	tenantId: string | null;
 	expiresAt?: string;
+	/** Scopes granted to the token (JWT `scope`). Added 0.12.0. */
+	scopes?: string[];
+	/** How the token was checked. Added 0.12.0. */
+	verifiedBy?: 'jwks' | 'userinfo' | 'legacy-me';
 };
 
 export type UserSessionResolverOptions = {
-	config: Pick<AccountsClientConfig, 'baseUrl'>;
+	/** `baseUrl` is the Accounts origin; `issuer` defaults to it. */
+	config: Pick<AccountsClientConfig, 'baseUrl'> & Partial<Pick<AccountsClientConfig, 'issuer' | 'discovery'>>;
 	fetchImpl?: typeof fetch;
-	/** Cache TTL in ms. Default 60_000; 0 disables caching. */
+	/** Cache TTL in ms. Default 60_000; 0 disables caching. Never outlives the token's exp. */
 	cacheTtlMs?: number;
+	/**
+	 * Accept only tokens issued to these client ids (`aud`). Strongly recommended: without it a
+	 * token issued to ANY Nipate app is accepted and the caller must check `appId` itself.
+	 */
+	audience?: string | readonly string[];
+	/** Ask userinfo when the JWKS is unreachable. Default true. */
+	remoteFallback?: boolean;
+	/** Check opaque (pre-JWT) bearers via GET /api/auth/me. Default true; turn off once Accounts issues JWTs. */
+	legacySessionTokens?: boolean;
+	/** Extra verifier options (endpoints, clock tolerance, JWKS cache TTL/cooldown, clock). */
+	verifier?: Partial<Omit<AccessTokenVerifierOptions, 'issuer' | 'audience' | 'fetchImpl'>>;
 };
 
 type MeResponse = {
@@ -147,10 +170,45 @@ export function sessionTokenFromHeaders(carrier: HeaderCarrier): string | null {
 export function createUserSessionResolver(opts: UserSessionResolverOptions) {
 	const ttl = opts.cacheTtlMs ?? 60_000;
 	const cache = new Map<string, { value: UserSessionContext | null; expires: number }>();
-	const fetchImpl = opts.fetchImpl ?? fetch;
+	const fetchImpl = opts.fetchImpl ?? ((...args: Parameters<typeof fetch>) => fetch(...args));
+	const base = opts.config.baseUrl?.trim().replace(/\/$/, '');
+	const issuer = (opts.config.issuer ?? base)?.trim();
+	const legacy = opts.legacySessionTokens ?? true;
+	let verifier: AccessTokenVerifier | null = null;
+	if (issuer) {
+		verifier = createAccessTokenVerifier({
+			discovery: opts.config.discovery,
+			...opts.verifier,
+			issuer,
+			audience: opts.audience,
+			remoteFallback: opts.remoteFallback ?? true,
+			fetchImpl
+		});
+	}
 
-	async function introspect(token: string): Promise<UserSessionContext | null> {
-		const base = opts.config.baseUrl?.replace(/\/$/, '');
+	async function viaJwt(token: string): Promise<UserSessionContext | null> {
+		if (!verifier) return null;
+		try {
+			const { claims, verifiedBy } = await verifier.verify(token);
+			const aud = Array.isArray(claims.aud) ? claims.aud[0] : claims.aud;
+			return {
+				userId: claims.sub,
+				email: typeof claims.email === 'string' ? claims.email : undefined,
+				name: typeof claims.name === 'string' ? claims.name : undefined,
+				sessionId: claims.sid ?? '',
+				appId: aud ?? null,
+				tenantId: claims.tid ?? null,
+				expiresAt: new Date(claims.exp * 1000).toISOString(),
+				scopes: claims.scope ? claims.scope.split(' ').filter(Boolean) : [],
+				verifiedBy
+			};
+		} catch {
+			// Invalid, expired, wrong audience, or Accounts unreachable: "not authenticated".
+			return null;
+		}
+	}
+
+	async function viaLegacyMe(token: string): Promise<UserSessionContext | null> {
 		if (!base || !token) return null;
 		try {
 			const res = await fetchImpl(new URL('/api/auth/me', base), {
@@ -161,20 +219,29 @@ export function createUserSessionResolver(opts: UserSessionResolverOptions) {
 			const userId = data.user?.id;
 			const sessionId = data.session?.id;
 			if (!userId || !sessionId) return null;
+			const appId = data.session?.appId ?? null;
+			const allowed = opts.audience === undefined ? null : typeof opts.audience === 'string' ? [opts.audience] : opts.audience;
+			if (allowed && (!appId || !allowed.includes(appId))) return null;
 			return {
 				userId,
 				email: data.user?.emailAddress ?? data.user?.email,
 				name: data.user?.name,
 				sessionId,
-				appId: data.session?.appId ?? null,
+				appId,
 				tenantId: data.session?.tenantId ?? null,
-				expiresAt: data.session?.expiresAt
+				expiresAt: data.session?.expiresAt,
+				verifiedBy: 'legacy-me'
 			};
 		} catch {
 			// Transport failure is indistinguishable from an invalid token to the caller: both are
 			// "not authenticated". Never throw — a flaky Accounts must not 500 the consuming service.
 			return null;
 		}
+	}
+
+	async function introspect(token: string): Promise<UserSessionContext | null> {
+		if (looksLikeJwt(token)) return viaJwt(token);
+		return legacy ? viaLegacyMe(token) : null;
 	}
 
 	async function resolve(carrier: HeaderCarrier): Promise<UserSessionContext | null> {
@@ -187,7 +254,10 @@ export function createUserSessionResolver(opts: UserSessionResolverOptions) {
 		if (cached && cached.expires > now) return cached.value;
 
 		const ctx = await introspect(token);
-		if (ttl > 0) cache.set(hash, { value: ctx, expires: now + ttl });
+		if (ttl > 0) {
+			const exp = ctx?.expiresAt ? Date.parse(ctx.expiresAt) : Infinity;
+			cache.set(hash, { value: ctx, expires: Math.min(now + ttl, exp) });
+		}
 		return ctx;
 	}
 

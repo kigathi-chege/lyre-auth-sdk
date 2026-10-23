@@ -13,6 +13,89 @@ Ships built ESM output from `dist/`, with type declarations.
 pnpm add @~lyre/auth        # or: npm i / yarn add
 ```
 
+## Sign in with Nipate Accounts
+
+Since 0.12.0 sign-in follows the Accounts OpenID Connect contract
+(`nipate/platform/docs/12-accounts-oidc.md`): authorization code + PKCE S256
+for every app, `state` + `nonce`, form-encoded token requests with client
+authentication, an RS256 `id_token` verified against the JWKS, and rotating
+refresh tokens. No new dependencies: JWT checks use `node:crypto`.
+
+Register the app in Accounts first (client id = app id; exact redirect URIs).
+Confidential apps (anything with a server) get a client secret; public apps
+(browser-only, CLI) have none and authenticate with `client_id` only.
+
+### SvelteKit
+
+```ts
+// src/hooks.server.ts
+import { createAccountsClientConfig } from '@~lyre/auth';
+import { createAuthHandle } from '@~lyre/auth/sveltekit';
+
+export const handle = createAuthHandle({
+  config: createAccountsClientConfig({
+    baseUrl: 'https://accounts.nipate.africa',       // ACCOUNTS_BASE_URL (issuer: ACCOUNTS_ISSUER)
+    clientId: 'shop',                                 // ACCOUNTS_CLIENT_ID
+    clientSecret: process.env.ACCOUNTS_CLIENT_SECRET, // confidential apps only
+    redirectUri: 'https://shop.example/auth/callback',
+    logoutRedirectUri: 'https://shop.example/'
+    // scopes default to: openid profile email offline_access
+  }),
+  sessionSecret: process.env.SESSION_SECRET,          // signs the session AND the login-state cookie
+  endAccountsSession: false,                          // true: logout also ends the Accounts session
+  protect: (event) => event.url.pathname.startsWith('/account')
+});
+```
+
+`/auth/login` stores `state`, `nonce` and the PKCE verifier in a 10-minute
+signed httpOnly cookie and redirects to `/auth/authorize`; `/auth/callback`
+checks state, exchanges the code, verifies the id_token and writes the app's
+own session; requests refresh the access token shortly before it expires
+(storing the rotated refresh token; a refused refresh signs the user out);
+`/auth/logout` revokes the refresh token. Failures become a 400 naming the
+`OidcError` code, or whatever `onAuthError` returns. Mock mode
+(`useMock`) keeps the old demo flow for local work without Accounts.
+
+### Plain Node
+
+```ts
+import { createOidcClient, isOidcError } from '@~lyre/auth';
+
+const accounts = createOidcClient({
+  issuer: 'https://accounts.nipate.africa',
+  clientId: 'premail',
+  clientSecret: process.env.ACCOUNTS_CLIENT_SECRET, // omit for a public client
+  redirectUri: 'https://premail.example/auth/callback',
+  postLogoutRedirectUri: 'https://premail.example/',
+  discovery: true // optional: read endpoints from /.well-known/openid-configuration (cached)
+});
+
+// 1. Start: keep state, nonce and codeVerifier (server-side or in a signed httpOnly cookie).
+const login = await accounts.beginLogin();
+//    createLoginStateCookie(login, { nextPath, secret }) / readLoginStateCookie(header, { secret })
+res.redirect(login.url);
+
+// 2. Callback: throws OidcError with a code (state_mismatch, nonce_mismatch, audience_mismatch,
+//    token_expired, token_request_failed + oauthError, …).
+const { claims, tokens } = await accounts.handleCallback({ url: req.url, expected: login });
+// claims.sub is the user id. Create your own session; store tokens.refreshToken.
+
+// 3. Later
+const fresh = await accounts.refresh(tokens.refreshToken!); // ALWAYS store fresh.refreshToken
+const { claims: at } = await accounts.verifyAccessToken(fresh.accessToken); // local JWKS check
+await accounts.revoke(fresh.refreshToken!);
+res.redirect(await accounts.logoutUrl()); // optional: end the Accounts session
+```
+
+Services that only receive bearer tokens use `createAccessTokenVerifier({ issuer, audience })`,
+or `createUserSessionResolver({ config: { baseUrl }, audience })` from `@~lyre/auth/nest`.
+Keys are cached and refetched when a token names an unknown `kid`; if the JWKS
+is unreachable, userinfo vouches for the token instead (`remoteFallback`).
+
+**Deprecated in 0.12.0** (still exported; removed in a later major):
+`beginAccountsLoginRedirect`, `handleAccountsCallback`, `exchangeAuthorizationCode`,
+`logoutFromAccounts`, and the `AuthorizationState` / `AccountsTokenResponse` types.
+
 ## Entry points
 
 ### `@~lyre/auth` — framework-agnostic core
@@ -33,7 +116,7 @@ import {
 } from '@~lyre/auth';
 ```
 
-The core depends only on `node:crypto` — no framework required.
+The core depends only on `node:crypto` and `fetch` — no framework required.
 
 ### `@~lyre/auth/sveltekit` — turnkey SvelteKit adapter
 
@@ -65,7 +148,10 @@ import { createServiceKeyResolver, createUserSessionResolver, hasScopes }
   from '@~lyre/auth/nest';
 
 const keys = createServiceKeyResolver({ config: { baseUrl: ACCOUNTS_BASE_URL } });
-const sessions = createUserSessionResolver({ config: { baseUrl: ACCOUNTS_BASE_URL } });
+const sessions = createUserSessionResolver({
+  config: { baseUrl: ACCOUNTS_BASE_URL },
+  audience: 'my-app' // accept only tokens issued to these client ids
+});
 
 // In a Nest guard (req is the Fastify request):
 const key = await keys.resolve(req);
@@ -75,9 +161,9 @@ if (key.status === 'ok') {
   // key.context.accessibleApps tells you which apps this key may act on
 }
 
-// A user session bearer resolves to who + which app, from the token alone:
+// An access-token bearer resolves to who + which app, verified locally against the JWKS:
 const user = await sessions.resolve(req);
-// → { userId, sessionId, appId, tenantId, email, name } | null
+// → { userId, sessionId, appId, tenantId, scopes, verifiedBy } | null
 ```
 
 Semantics match `createServiceKeyHandle`: **absent key → `absent`** (fall through to
@@ -87,8 +173,9 @@ results too, so a bad key can't hammer Accounts. Neither resolver throws: a
 transport failure reads as "not authenticated", so a flaky Accounts cannot 500
 the consuming service.
 
-`resolve()` needs `GET /api/auth/me` to return `session.appId` (Accounts ≥ the
-release that added it); older deployments yield `appId: null`.
+JWT bearers are verified locally (`aud` → `appId`, `tid` → `tenantId`, `sid` →
+`sessionId`). Opaque pre-JWT session ids still go to the legacy
+`GET /api/auth/me` until you pass `legacySessionTokens: false`.
 
 ## Publishing
 

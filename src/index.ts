@@ -1,4 +1,16 @@
 import { createHmac, timingSafeEqual } from 'node:crypto';
+import {
+	DEFAULT_OIDC_SCOPES,
+	createOidcClient,
+	type IdTokenClaims,
+	type OidcClient,
+	type OidcClientOptions,
+	type OidcLoginExpectation,
+	type OidcLoginRequest,
+	type UserInfo
+} from './oidc';
+
+export * from './oidc';
 
 const SESSION_COOKIE_NAME = 'platform_session';
 const STATE_COOKIE_NAME = 'accounts_auth_state';
@@ -67,20 +79,31 @@ export type PlatformSession = {
 };
 
 export type AccountsClientConfig = {
+	/** Accounts origin, e.g. `https://accounts.nipate.africa`. */
 	baseUrl?: string;
+	/** OIDC issuer. Defaults to `baseUrl`. Added 0.12.0. */
+	issuer?: string;
 	clientId: string;
+	/** Confidential apps only; public apps leave it unset. */
 	clientSecret?: string;
 	redirectUri: string;
+	/** Absolute URL Accounts returns the browser to after `/auth/logout`. */
 	logoutRedirectUri?: string;
+	/** Requested scopes. Default `openid profile email offline_access`. Added 0.12.0. */
+	scopes?: string[];
+	/** Load endpoints from `/.well-known/openid-configuration`. Default false. Added 0.12.0. */
+	discovery?: boolean;
 	useMock?: boolean;
 };
 
+/** @deprecated Since 0.12.0; legacy login state. See `OidcLoginRequest`. */
 export type AuthorizationState = {
 	nonce: string;
 	nextPath: string;
 	tenantSlug?: string;
 };
 
+/** @deprecated Since 0.12.0; legacy token response with a `user`. See `TokenSet` + `IdTokenClaims`. */
 export type AccountsTokenResponse = {
 	access_token: string;
 	refresh_token?: string;
@@ -113,6 +136,13 @@ export type SyncAccountsUser = (identity: AccountsIdentity) => SyncAccountsUserR
 export function createAccountsClientConfig(input: Partial<AccountsClientConfig> = {}): AccountsClientConfig {
 	return {
 		baseUrl: normalizeOptionalString(input.baseUrl ?? process.env.ACCOUNTS_BASE_URL),
+		issuer: normalizeOptionalString(input.issuer ?? process.env.ACCOUNTS_ISSUER),
+		scopes:
+			input.scopes ??
+			(normalizeOptionalString(process.env.ACCOUNTS_SCOPES)?.split(/[\s,]+/).filter(Boolean) ?? [
+				...DEFAULT_OIDC_SCOPES
+			]),
+		discovery: input.discovery ?? process.env.ACCOUNTS_DISCOVERY === 'true',
 		clientId: input.clientId ?? process.env.ACCOUNTS_CLIENT_ID ?? 'accounts-app',
 		clientSecret: normalizeOptionalString(input.clientSecret ?? process.env.ACCOUNTS_CLIENT_SECRET),
 		redirectUri:
@@ -127,6 +157,50 @@ export function createAccountsClientConfig(input: Partial<AccountsClientConfig> 
 				!process.env.ACCOUNTS_CLIENT_ID
 			)
 	};
+}
+
+/**
+ * Build an OIDC client from an AccountsClientConfig (issuer falls back to baseUrl). Added 0.12.0.
+ */
+export function createOidcClientFromConfig(
+	config: AccountsClientConfig,
+	overrides: Partial<OidcClientOptions> = {}
+): OidcClient {
+	const issuer = overrides.issuer ?? config.issuer ?? config.baseUrl;
+	if (!issuer) throw new Error('Accounts issuer/baseUrl is required for sign-in.');
+	return createOidcClient({
+		issuer,
+		clientId: config.clientId,
+		clientSecret: config.clientSecret,
+		redirectUri: config.redirectUri,
+		postLogoutRedirectUri: config.logoutRedirectUri,
+		scopes: config.scopes,
+		discovery: config.discovery,
+		...overrides
+	});
+}
+
+/** Map verified id_token (and optional userinfo) claims to an AccountsIdentity. Added 0.12.0. */
+export function identityFromClaims(claims: IdTokenClaims | UserInfo, userInfo?: UserInfo): AccountsIdentity {
+	const c = { ...claims, ...(userInfo ?? {}) } as Record<string, unknown>;
+	const str = (k: string) => (typeof c[k] === 'string' && c[k] ? (c[k] as string) : undefined);
+	const firstName = str('given_name');
+	const lastName = str('family_name');
+	const sub = claims.sub;
+	return {
+		id: sub,
+		email: str('email') ?? `${sub}@accounts.local`,
+		name: str('name') ?? ([firstName, lastName].filter(Boolean).join(' ') || 'Accounts User'),
+		firstName,
+		lastName,
+		avatarUrl: str('picture')
+	};
+}
+
+/** Only same-origin absolute paths: `/x` yes, `//evil.example` and `/\\evil` no. */
+export function safeNextPath(value: string | null | undefined): string {
+	if (!value || !value.startsWith('/') || value.startsWith('//') || value.startsWith('/\\')) return '/';
+	return value;
 }
 
 export function createPlatformAuth() {
@@ -144,6 +218,10 @@ export function createPlatformAuth() {
 	};
 }
 
+/**
+ * @deprecated Since 0.12.0. Sends no PKCE, nonce or scope, which Accounts now refuses. Use
+ * `createOidcClient().beginLogin()` (+ `createLoginStateCookie`). Still used for mock mode.
+ */
 export function beginAccountsLoginRedirect(
 	config: AccountsClientConfig,
 	options: {
@@ -183,6 +261,10 @@ export function beginAccountsLoginRedirect(
 	};
 }
 
+/**
+ * @deprecated Since 0.12.0. Trusts the token response's `user` instead of a verified id_token. Use
+ * `createOidcClient().handleCallback()` (+ `readLoginStateCookie`). Still used for mock mode.
+ */
 export async function handleAccountsCallback(input: {
 	config: AccountsClientConfig;
 	code: string;
@@ -235,6 +317,10 @@ export async function handleAccountsCallback(input: {
 	};
 }
 
+/**
+ * @deprecated Since 0.12.0. JSON body, no PKCE verifier, no client authentication. Use
+ * `createOidcClient().exchangeCode()` or `.handleCallback()`.
+ */
 export async function exchangeAuthorizationCode(input: {
 	config: AccountsClientConfig;
 	code: string;
@@ -365,6 +451,66 @@ function unsignValue(signed: string, secret: string): string | null {
 
 export function clearPlatformSessionCookie(opts?: CookieOptions) {
 	return `${SESSION_COOKIE_NAME}=; ${cookieAttrs(opts)}; Max-Age=0`;
+}
+
+/** Set-Cookie string for a PlatformSession (HMAC-signed when `secret` is set). Added 0.12.0. */
+export function createPlatformSessionCookie(session: PlatformSession, opts?: CookieOptions, secret?: string) {
+	return createSessionCookie(session, opts, secret);
+}
+
+// ── Login state cookie (OIDC) ─────────────────────────────────────────────────────
+// Between /auth/login and /auth/callback the app must keep state, nonce and the PKCE verifier. This
+// keeps them in a short-lived httpOnly cookie, HMAC-signed when a secret is given. Added 0.12.0.
+
+export const LOGIN_STATE_COOKIE_NAME = 'accounts_oidc_login';
+const LOGIN_STATE_MAX_AGE_SEC = 60 * 10;
+
+export type StoredLogin = OidcLoginExpectation & {
+	nextPath: string;
+	tenantSlug?: string;
+	/** Epoch seconds when the login started. */
+	issuedAt: number;
+};
+
+export function createLoginStateCookie(
+	login: OidcLoginRequest | OidcLoginExpectation,
+	options: { nextPath?: string; tenantSlug?: string; secret?: string; cookieOptions?: CookieOptions } = {}
+): string {
+	const payload: StoredLogin = {
+		state: login.state,
+		nonce: login.nonce,
+		codeVerifier: login.codeVerifier,
+		nextPath: safeNextPath(options.nextPath),
+		tenantSlug: options.tenantSlug,
+		issuedAt: Math.floor(Date.now() / 1000)
+	};
+	const raw = Buffer.from(JSON.stringify(payload)).toString('base64url');
+	const value = options.secret ? signValue(raw, options.secret) : raw;
+	return `${LOGIN_STATE_COOKIE_NAME}=${value}; ${cookieAttrs(options.cookieOptions)}; Max-Age=${LOGIN_STATE_MAX_AGE_SEC}`;
+}
+
+/** Read (and, with a secret, verify) the login state cookie. Null when absent, forged or older than 10 minutes. */
+export function readLoginStateCookie(
+	cookieHeader: string | null | undefined,
+	options: { secret?: string } = {}
+): StoredLogin | null {
+	const value = readCookie(cookieHeader, LOGIN_STATE_COOKIE_NAME);
+	if (!value) return null;
+	const raw = options.secret ? unsignValue(value, options.secret) : value;
+	if (raw == null) return null;
+	try {
+		const parsed = JSON.parse(Buffer.from(raw, 'base64url').toString('utf8')) as StoredLogin;
+		if (!parsed || typeof parsed.state !== 'string' || typeof parsed.nonce !== 'string') return null;
+		if (typeof parsed.codeVerifier !== 'string') return null;
+		if (typeof parsed.issuedAt !== 'number' || Date.now() / 1000 - parsed.issuedAt > LOGIN_STATE_MAX_AGE_SEC) return null;
+		return { ...parsed, nextPath: safeNextPath(parsed.nextPath) };
+	} catch {
+		return null;
+	}
+}
+
+export function clearLoginStateCookie(opts?: CookieOptions): string {
+	return `${LOGIN_STATE_COOKIE_NAME}=; ${cookieAttrs(opts)}; Max-Age=0`;
 }
 
 function createSessionCookie(session: PlatformSession, opts?: CookieOptions, secret?: string) {
@@ -518,6 +664,10 @@ export async function introspectServiceKey(input: {
 	}
 }
 
+/**
+ * @deprecated Since 0.12.0. The contract signs out by revoking the refresh token
+ * (`OidcClient.revoke`) and optionally sending the browser to `OidcClient.logoutUrl()`.
+ */
 // Revoke the user's session at Axis Accounts (server-side logout). Clearing the local session
 // cookie logs the user out of THIS app; this additionally revokes the session upstream so it can't
 // be reused. `all: true` revokes every session for the user (log out everywhere). Best-effort:
