@@ -11,6 +11,7 @@ import {
 } from './oidc';
 
 export * from './oidc';
+export * from './launcher';
 
 const SESSION_COOKIE_NAME = 'platform_session';
 const STATE_COOKIE_NAME = 'accounts_auth_state';

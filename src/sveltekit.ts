@@ -34,6 +34,7 @@ import {
 	type SyncAccountsUser,
 	type TokenSet
 } from './index';
+import { fetchLauncherApps, launcherScriptUrl, type LauncherData } from './launcher';
 
 const STATE_COOKIE = 'accounts_auth_state'; // legacy (mock-mode) login state
 const REFRESH_SKEW_MS = 60_000;
@@ -414,3 +415,22 @@ export function createAccountsWebhookHandle(opts: AccountsWebhookOptions): Handl
 }
 
 export { clearPlatformSessionCookie };
+
+// ── App switcher (<nipate-apps>) ─────────────────────────────────────────────────
+/**
+ * The apps the signed-in user can switch to, fetched server-side with their Accounts access token
+ * (kept fresh by `createAuthHandle`), so the page needs no CORS and never sees the token. Use it
+ * in a layout `load` and hand the result to `<nipate-apps>`'s `data` property. Signed out, or
+ * Accounts unreachable: `{ apps: [], chooserUrl: null }`. Added 0.13.0.
+ *
+ *   // +layout.server.ts
+ *   export const load = async (event) => ({ launcher: await loadLauncherApps(event, { baseUrl }) });
+ */
+export async function loadLauncherApps(
+	event: Pick<RequestEvent, 'locals'>,
+	opts: { baseUrl: string; fetchImpl?: typeof fetch; cacheTtlMs?: number; timeoutMs?: number }
+): Promise<LauncherData & { scriptUrl: string }> {
+	const session = (event.locals as Partial<PlatformLocals>).session;
+	const data = await fetchLauncherApps({ ...opts, accessToken: session?.principal ? session.accessToken : null });
+	return { ...data, scriptUrl: launcherScriptUrl(opts.baseUrl) };
+}

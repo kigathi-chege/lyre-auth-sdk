@@ -96,6 +96,34 @@ is unreachable, userinfo vouches for the token instead (`remoteFallback`).
 `beginAccountsLoginRedirect`, `handleAccountsCallback`, `exchangeAuthorizationCode`,
 `logoutFromAccounts`, and the `AuthorizationState` / `AccountsTokenResponse` types.
 
+## App switcher (`<nipate-apps>`), 0.13.0
+
+Every app shows the same apps menu. Accounts serves the web component at
+`https://accounts.nipate.africa/embed/apps.js`; the SDK fetches the list server-side with the
+user's access token (no CORS, the token never reaches the page):
+
+```ts
+// src/routes/+layout.server.ts
+import { loadLauncherApps } from '@~lyre/auth/sveltekit';
+export const load = async (event) => ({
+  launcher: await loadLauncherApps(event, { baseUrl: 'https://accounts.nipate.africa' })
+});
+```
+
+```svelte
+<!-- header -->
+<svelte:head><script type="module" src={data.launcher.scriptUrl}></script></svelte:head>
+{#if data.launcher.apps.length}<nipate-apps data={data.launcher} label="Nipate apps"></nipate-apps>{/if}
+```
+
+Each entry (`LauncherApp`) has `id, slug, name, description, iconUrl, color, launchUrl,
+displayOrder, current`; `launchUrl` is the app's `initiate_login_uri`, so opening an app signs the
+person in silently through Accounts. Signed out or Accounts unreachable: an empty list, never an
+error. Browser-only apps can use `fetchLauncherApps({ baseUrl, accessToken })` from
+`@~lyre/auth/launcher` (no Node imports), or give the element `accounts="https://accounts…"` and a
+`token` property. Theme with `--nipate-apps-bg`, `-fg`, `-muted`, `-border`, `-accent`, `-hover`,
+`-radius`, `-shadow`, `-width`, `-font`, or `::part(button|panel|item|icon|name|description)`.
+
 ## Entry points
 
 ### `@~lyre/auth` — framework-agnostic core
